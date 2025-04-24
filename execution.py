@@ -18,13 +18,16 @@ from comfy_execution.graph_utils import is_link, GraphBuilder
 from comfy_execution.caching import HierarchicalCache, LRUCache, CacheKeySetInputSignature, CacheKeySetID
 from comfy_execution.validation import validate_node_input
 
+
 class ExecutionResult(Enum):
     SUCCESS = 0
     FAILURE = 1
     PENDING = 2
 
+
 class DuplicateNodeError(Exception):
     pass
+
 
 class IsChangedCache:
     def __init__(self, dynprompt, outputs_cache):
@@ -59,6 +62,7 @@ class IsChangedCache:
             self.is_changed[node_id] = node["is_changed"]
         return self.is_changed[node_id]
 
+
 class CacheSet:
     def __init__(self, lru_size=None):
         if lru_size is None or lru_size == 0:
@@ -87,6 +91,7 @@ class CacheSet:
         }
         return result
 
+
 def get_input_data(inputs, class_def, unique_id, outputs=None, dynprompt=None, extra_data={}):
     valid_inputs = class_def.INPUT_TYPES()
     input_data_all = {}
@@ -94,15 +99,17 @@ def get_input_data(inputs, class_def, unique_id, outputs=None, dynprompt=None, e
     for x in inputs:
         input_data = inputs[x]
         input_type, input_category, input_info = get_input_info(class_def, x, valid_inputs)
+
         def mark_missing():
             missing_keys[x] = True
             input_data_all[x] = (None,)
+
         if is_link(input_data) and (not input_info or not input_info.get("rawLink", False)):
             input_unique_id = input_data[0]
             output_index = input_data[1]
             if outputs is None:
                 mark_missing()
-                continue # This might be a lazily-evaluated input
+                continue  # This might be a lazily-evaluated input
             cached_output = outputs.get(input_unique_id)
             if cached_output is None:
                 mark_missing()
@@ -126,9 +133,13 @@ def get_input_data(inputs, class_def, unique_id, outputs=None, dynprompt=None, e
                 input_data_all[x] = [extra_data.get('extra_pnginfo', None)]
             if h[x] == "UNIQUE_ID":
                 input_data_all[x] = [unique_id]
+            if h[x] == "PROMPT_ID":
+                input_data_all[x] = [extra_data.get('prompt_id', None)]
     return input_data_all, missing_keys
 
-map_node_over_list = None #Don't hook this please
+
+map_node_over_list = None  # Don't hook this please
+
 
 def _map_node_over_list(obj, input_data_all, func, allow_interrupt=False, execution_block_cb=None, pre_execute_cb=None):
     # check if node wants the lists
@@ -144,6 +155,7 @@ def _map_node_over_list(obj, input_data_all, func, allow_interrupt=False, execut
         return {k: v[i if len(v) > i else -1] for k, v in d.items()}
 
     results = []
+
     def process_inputs(inputs, index=None, input_is_list=False):
         if allow_interrupt:
             nodes.before_node_execution()
@@ -174,6 +186,7 @@ def _map_node_over_list(obj, input_data_all, func, allow_interrupt=False, execut
             process_inputs(input_dict, i)
     return results
 
+
 def merge_result_data(results, obj):
     # check which outputs need concatenating
     output = []
@@ -195,11 +208,13 @@ def merge_result_data(results, obj):
             output.append([o[i] for o in results])
     return output
 
+
 def get_output_data(obj, input_data_all, execution_block_cb=None, pre_execute_cb=None):
     results = []
     uis = []
     subgraph_results = []
-    return_values = _map_node_over_list(obj, input_data_all, obj.FUNCTION, allow_interrupt=True, execution_block_cb=execution_block_cb, pre_execute_cb=pre_execute_cb)
+    return_values = _map_node_over_list(obj, input_data_all, obj.FUNCTION, allow_interrupt=True,
+                                        execution_block_cb=execution_block_cb, pre_execute_cb=pre_execute_cb)
     has_subgraph = False
     for i in range(len(return_values)):
         r = return_values[i]
@@ -237,6 +252,7 @@ def get_output_data(obj, input_data_all, execution_block_cb=None, pre_execute_cb
         ui = {k: [y for x in uis for y in x[k]] for k in uis[0].keys()}
     return output, ui, has_subgraph
 
+
 def format_value(x):
     if x is None:
         return None
@@ -245,7 +261,17 @@ def format_value(x):
     else:
         return str(x)
 
-def execute(server, dynprompt, caches, current_item, extra_data, executed, prompt_id, execution_list, pending_subgraph_results):
+
+def execute(server, dynprompt, caches, current_item, extra_data, executed, prompt_id, execution_list,
+            pending_subgraph_results):
+    extra_data['prompt_id'] = prompt_id
+    client_id = None
+    if extra_data['client_id'] is not None:
+        client_id = extra_data['client_id']
+
+    if client_id is None and server.client_id is not None:
+        client_id = server.client_id
+
     unique_id = current_item
     real_node_id = dynprompt.get_real_node_id(unique_id)
     display_node_id = dynprompt.get_display_node_id(unique_id)
@@ -254,9 +280,11 @@ def execute(server, dynprompt, caches, current_item, extra_data, executed, promp
     class_type = dynprompt.get_node(unique_id)['class_type']
     class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
     if caches.outputs.get(unique_id) is not None:
-        if server.client_id is not None:
+        if client_id is not None:
             cached_output = caches.ui.get(unique_id) or {}
-            server.send_sync("executed", { "node": unique_id, "display_node": display_node_id, "output": cached_output.get("output",None), "prompt_id": prompt_id }, server.client_id)
+            server.send_sync("executed", {"node": unique_id, "display_node": display_node_id,
+                                          "output": cached_output.get("output", None), "prompt_id": prompt_id},
+                             client_id)
         return (ExecutionResult.SUCCESS, None, None)
 
     input_data_all = None
@@ -283,10 +311,13 @@ def execute(server, dynprompt, caches, current_item, extra_data, executed, promp
             output_ui = []
             has_subgraph = False
         else:
-            input_data_all, missing_keys = get_input_data(inputs, class_def, unique_id, caches.outputs, dynprompt, extra_data)
-            if server.client_id is not None:
+            input_data_all, missing_keys = get_input_data(inputs, class_def, unique_id, caches.outputs, dynprompt,
+                                                          extra_data)
+            if client_id is not None:
                 server.last_node_id = display_node_id
-                server.send_sync("executing", { "node": unique_id, "display_node": display_node_id, "prompt_id": prompt_id }, server.client_id)
+                server.send_sync("executing",
+                                 {"node": unique_id, "display_node": display_node_id, "prompt_id": prompt_id},
+                                 client_id)
 
             obj = caches.objects.get(unique_id)
             if obj is None:
@@ -295,9 +326,9 @@ def execute(server, dynprompt, caches, current_item, extra_data, executed, promp
 
             if hasattr(obj, "check_lazy_status"):
                 required_inputs = _map_node_over_list(obj, input_data_all, "check_lazy_status", allow_interrupt=True)
-                required_inputs = set(sum([r for r in required_inputs if isinstance(r,list)], []))
-                required_inputs = [x for x in required_inputs if isinstance(x,str) and (
-                    x not in input_data_all or x in missing_keys
+                required_inputs = set(sum([r for r in required_inputs if isinstance(r, list)], []))
+                required_inputs = [x for x in required_inputs if isinstance(x, str) and (
+                        x not in input_data_all or x in missing_keys
                 )]
                 if len(required_inputs) > 0:
                     for i in required_inputs:
@@ -318,13 +349,18 @@ def execute(server, dynprompt, caches, current_item, extra_data, executed, promp
                         "current_inputs": [],
                         "current_outputs": [],
                     }
-                    server.send_sync("execution_error", mes, server.client_id)
+                    # server.send_sync("execution_error", mes, client_id)
+                    server.send_sync("execution_error", mes, client_id)
                     return ExecutionBlocker(None)
                 else:
                     return block
+
             def pre_execute_cb(call_index):
                 GraphBuilder.set_default_prefix(unique_id, call_index, 0)
-            output_data, output_ui, has_subgraph = get_output_data(obj, input_data_all, execution_block_cb=execution_block_cb, pre_execute_cb=pre_execute_cb)
+
+            output_data, output_ui, has_subgraph = get_output_data(obj, input_data_all,
+                                                                   execution_block_cb=execution_block_cb,
+                                                                   pre_execute_cb=pre_execute_cb)
         if len(output_ui) > 0:
             caches.ui.set(unique_id, {
                 "meta": {
@@ -335,8 +371,9 @@ def execute(server, dynprompt, caches, current_item, extra_data, executed, promp
                 },
                 "output": output_ui
             })
-            if server.client_id is not None:
-                server.send_sync("executed", { "node": unique_id, "display_node": display_node_id, "output": output_ui, "prompt_id": prompt_id }, server.client_id)
+            if client_id is not None:
+                server.send_sync("executed", {"node": unique_id, "display_node": display_node_id, "output": output_ui,
+                                              "prompt_id": prompt_id}, client_id)
         if has_subgraph:
             cached_outputs = []
             new_node_ids = []
@@ -350,7 +387,8 @@ def execute(server, dynprompt, caches, current_item, extra_data, executed, promp
                     # Check for conflicts
                     for node_id in new_graph.keys():
                         if dynprompt.has_node(node_id):
-                            raise DuplicateNodeError(f"Attempt to add duplicate node {node_id}. Ensure node ids are unique and deterministic or use graph_utils.GraphBuilder.")
+                            raise DuplicateNodeError(
+                                f"Attempt to add duplicate node {node_id}. Ensure node ids are unique and deterministic or use graph_utils.GraphBuilder.")
                     for node_id, node_info in new_graph.items():
                         new_node_ids.append(node_id)
                         display_id = node_info.get("override_display_id", unique_id)
@@ -413,10 +451,14 @@ def execute(server, dynprompt, caches, current_item, extra_data, executed, promp
 
     return (ExecutionResult.SUCCESS, None, None)
 
+
 class PromptExecutor:
+    client_id: str
+
     def __init__(self, server, lru_size=None):
         self.lru_size = lru_size
         self.server = server
+        self.client_id = self.server.client_id
         self.reset()
 
     def reset(self):
@@ -466,11 +508,12 @@ class PromptExecutor:
 
         if "client_id" in extra_data:
             self.server.client_id = extra_data["client_id"]
+            self.client_id = extra_data["client_id"]
         else:
             self.server.client_id = None
 
         self.status_messages = []
-        self.add_message("execution_start", { "prompt_id": prompt_id}, broadcast=False)
+        self.add_message("execution_start", {"prompt_id": prompt_id}, broadcast=False)
 
         with torch.inference_mode():
             dynamic_prompt = DynamicPrompt(prompt)
@@ -486,8 +529,8 @@ class PromptExecutor:
 
             comfy.model_management.cleanup_models_gc()
             self.add_message("execution_cached",
-                          { "nodes": cached_nodes, "prompt_id": prompt_id},
-                          broadcast=False)
+                             {"nodes": cached_nodes, "prompt_id": prompt_id},
+                             broadcast=False)
             pending_subgraph_results = {}
             executed = set()
             execution_list = ExecutionList(dynamic_prompt, self.caches.outputs)
@@ -498,21 +541,24 @@ class PromptExecutor:
             while not execution_list.is_empty():
                 node_id, error, ex = execution_list.stage_node_execution()
                 if error is not None:
-                    self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
+                    self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed,
+                                                error, ex)
                     break
 
-                result, error, ex = execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id, execution_list, pending_subgraph_results)
+                result, error, ex = execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed,
+                                            prompt_id, execution_list, pending_subgraph_results)
                 self.success = result != ExecutionResult.FAILURE
                 if result == ExecutionResult.FAILURE:
-                    self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
+                    self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed,
+                                                error, ex)
                     break
                 elif result == ExecutionResult.PENDING:
                     execution_list.unstage_node_execution()
-                else: # result == ExecutionResult.SUCCESS:
+                else:  # result == ExecutionResult.SUCCESS:
                     execution_list.complete_node_execution()
             else:
                 # Only execute when the while-loop ends without break
-                self.add_message("execution_success", { "prompt_id": prompt_id }, broadcast=False)
+                self.add_message("execution_success", {"prompt_id": prompt_id}, broadcast=False)
 
             ui_outputs = {}
             meta_outputs = {}
@@ -541,7 +587,7 @@ def validate_inputs(prompt, item, validated):
     obj_class = nodes.NODE_CLASS_MAPPINGS[class_type]
 
     class_inputs = obj_class.INPUT_TYPES()
-    valid_inputs = set(class_inputs.get('required',{})).union(set(class_inputs.get('optional',{})))
+    valid_inputs = set(class_inputs.get('required', {})).union(set(class_inputs.get('optional', {})))
 
     errors = []
     valid = True
@@ -731,7 +777,7 @@ def validate_inputs(prompt, item, validated):
         if 'input_types' in validate_function_inputs:
             input_filtered['input_types'] = [received_types]
 
-        #ret = obj_class.VALIDATE_INPUTS(**input_filtered)
+        # ret = obj_class.VALIDATE_INPUTS(**input_filtered)
         ret = _map_node_over_list(obj_class, input_filtered, "VALIDATE_INPUTS")
         for x in input_filtered:
             for i, r in enumerate(ret):
@@ -759,11 +805,13 @@ def validate_inputs(prompt, item, validated):
     validated[unique_id] = ret
     return ret
 
+
 def full_type_name(klass):
     module = klass.__module__
     if module == 'builtins':
         return klass.__qualname__
     return module + '.' + klass.__qualname__
+
 
 def validate_prompt(prompt):
     outputs = set()
@@ -873,7 +921,9 @@ def validate_prompt(prompt):
 
     return (True, None, list(good_outputs), node_errors)
 
+
 MAXIMUM_HISTORY_SIZE = 10000
+
 
 class PromptQueue:
     def __init__(self, server):

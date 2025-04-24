@@ -1,3 +1,5 @@
+import torch
+
 import comfy.options
 comfy.options.enable_args_parsing()
 
@@ -112,6 +114,7 @@ if __name__ == "__main__":
     if args.cuda_device is not None:
         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.cuda_device)
         os.environ['HIP_VISIBLE_DEVICES'] = str(args.cuda_device)
+        torch.cuda.set_device(0)
         logging.info("Set cuda device to: {}".format(args.cuda_device))
 
     if args.oneapi_device_selector is not None:
@@ -153,16 +156,19 @@ def cuda_malloc_warning():
         if cuda_malloc_warning:
             logging.warning("\nWARNING: this card most likely does not support cuda-malloc, if you get \"CUDA error\" please run ComfyUI with: --disable-cuda-malloc\n")
 
-
-def prompt_worker(q, server_instance):
+def prompt_worker(q, server_instance, gpu_id):
     current_time: float = 0.0
     e = execution.PromptExecutor(server_instance, lru_size=args.cache_lru)
     last_gc_collect = 0
     need_gc = False
     gc_collect_interval = 10.0
 
+    if torch.cuda.is_available():
+        torch.cuda.set_device(gpu_id)
+        print('torch.cuda.current_device():', torch.cuda.current_device())
+
     while True:
-        timeout = 1000.0
+        timeout = 10000.0
         if need_gc:
             timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.0)
 
@@ -173,6 +179,8 @@ def prompt_worker(q, server_instance):
             prompt_id = item[1]
             server_instance.last_prompt_id = prompt_id
 
+            extra_data = item[3]
+            client_id = extra_data['client_id']
             e.execute(item[2], prompt_id, item[3], item[4])
             need_gc = True
             q.task_done(item_id,
@@ -268,7 +276,8 @@ def start_comfyui(asyncio_loop=None):
     prompt_server.add_routes()
     hijack_progress(prompt_server)
 
-    threading.Thread(target=prompt_worker, daemon=True, args=(q, prompt_server,)).start()
+    threading.Thread(target=prompt_worker, daemon=True, args=(q, prompt_server, 0)).start()
+    threading.Thread(target=prompt_worker, daemon=True, args=(q, prompt_server, 1)).start()
 
     if args.quick_test_for_ci:
         exit(0)
