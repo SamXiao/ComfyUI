@@ -9,6 +9,7 @@ from enum import Enum
 import inspect
 from typing import List, Literal, NamedTuple, Optional
 
+import requests
 import torch
 import nodes
 
@@ -472,8 +473,8 @@ class PromptExecutor:
             "timestamp": int(time.time() * 1000),
         }
         self.status_messages.append((event, data))
-        if self.server.client_id is not None or broadcast:
-            self.server.send_sync(event, data, self.server.client_id)
+        if self.client_id is not None or broadcast:
+            self.server.send_sync(event, data, self.client_id)
 
     def handle_execution_error(self, prompt_id, prompt, current_outputs, executed, error, ex):
         node_id = error["node_id"]
@@ -502,6 +503,14 @@ class PromptExecutor:
                 "current_outputs": list(current_outputs),
             }
             self.add_message("execution_error", mes, broadcast=False)
+        post_data = {
+            "promptId": prompt_id,
+            "status": 'failed',
+            "taskGenerationImagesVoList": None
+        }
+        request_url = "http://test.feituhuabi.cn/pc-api/ai-tasks/updateStatus"
+        # 发送POST请求到服务器
+        response = requests.post(request_url, json=post_data)
 
     def execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
         nodes.interrupt_processing(False)
@@ -514,6 +523,7 @@ class PromptExecutor:
 
         self.status_messages = []
         self.add_message("execution_start", {"prompt_id": prompt_id}, broadcast=False)
+        logging.info(f"Starting execution prompt: {prompt}")
 
         with torch.inference_mode():
             dynamic_prompt = DynamicPrompt(prompt)

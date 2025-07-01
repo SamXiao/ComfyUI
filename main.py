@@ -189,8 +189,8 @@ def prompt_worker(q, server_instance, gpu_id):
                             status_str='success' if e.success else 'error',
                             completed=e.success,
                             messages=e.status_messages))
-            if server_instance.client_id is not None:
-                server_instance.send_sync("executing", {"node": None, "prompt_id": prompt_id}, server_instance.client_id)
+            if client_id is not None:
+                server_instance.send_sync("executing", {"node": None, "prompt_id": prompt_id}, client_id)
 
             current_time = time.perf_counter()
             execution_time = current_time - execution_start_time

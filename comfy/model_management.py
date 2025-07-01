@@ -172,35 +172,51 @@ def get_torch_device():
             return torch.device(torch.cuda.current_device())
 
 def get_total_memory(dev=None, torch_total_too=False):
+    """
+    获取设备的总内存和（可选）PyTorch可用的总内存。
+
+    参数:
+    dev (torch.device): 指定的设备。如果为None，则使用默认设备。
+    torch_total_too (bool): 如果为True，则同时返回PyTorch可用的总内存。
+
+    返回:
+    int 或 tuple: 设备的总内存（字节）。如果torch_total_too为True，则返回一个包含（设备总内存，PyTorch可用总内存）的元组。
+    """
     global directml_enabled
     if dev is None:
         dev = get_torch_device()
 
     if hasattr(dev, 'type') and (dev.type == 'cpu' or dev.type == 'mps'):
+        # 对于CPU或MPS设备，总内存等于系统虚拟内存的总量。
         mem_total = psutil.virtual_memory().total
         mem_total_torch = mem_total
     else:
         if directml_enabled:
+            # 当启用DirectML时，暂定总内存为1GB（需根据实际情况调整）。
             mem_total = 1024 * 1024 * 1024 #TODO
             mem_total_torch = mem_total
         elif is_intel_xpu():
+            # 对于Intel XPU设备，获取内存统计信息和总内存。
             stats = torch.xpu.memory_stats(dev)
             mem_reserved = stats['reserved_bytes.all.current']
             mem_total_torch = mem_reserved
             mem_total = torch.xpu.get_device_properties(dev).total_memory
         elif is_ascend_npu():
+            # 对于Ascend NPU设备，获取内存统计信息和总内存。
             stats = torch.npu.memory_stats(dev)
             mem_reserved = stats['reserved_bytes.all.current']
             _, mem_total_npu = torch.npu.mem_get_info(dev)
             mem_total_torch = mem_reserved
             mem_total = mem_total_npu
         elif is_mlu():
+            # 对于MLU设备，获取内存统计信息和总内存。
             stats = torch.mlu.memory_stats(dev)
             mem_reserved = stats['reserved_bytes.all.current']
             _, mem_total_mlu = torch.mlu.mem_get_info(dev)
             mem_total_torch = mem_reserved
             mem_total = mem_total_mlu
         else:
+            # 对于其他设备（如CUDA设备），获取内存统计信息和总内存。
             stats = torch.cuda.memory_stats(dev)
             mem_reserved = stats['reserved_bytes.all.current']
             _, mem_total_cuda = torch.cuda.mem_get_info(dev)
@@ -208,9 +224,12 @@ def get_total_memory(dev=None, torch_total_too=False):
             mem_total = mem_total_cuda
 
     if torch_total_too:
+        # 如果需要，返回设备总内存和PyTorch可用总内存。
         return (mem_total, mem_total_torch)
     else:
+        # 仅返回设备总内存。
         return mem_total
+
 
 def mac_version():
     try:
@@ -385,6 +404,18 @@ except:
 
 
 current_loaded_models = []
+current_loaded_models_by_gpu = []
+
+def get_current_loaded_models(device=None):
+    if device is None:
+        device = get_torch_device()
+
+    if len(current_loaded_models_by_gpu) < device.index + 1:
+        current_loaded_models_by_gpu.append([])
+    return current_loaded_models_by_gpu[device.index]
+
+def set_current_loaded_models(device, models):
+    current_loaded_models_by_gpu[device.index] = models
 
 def module_size(module):
     module_mem = 0
@@ -480,6 +511,9 @@ class LoadedModel:
             self._patcher_finalizer.detach()
 
     def is_dead(self):
+        logging.info(f"is_dead {self.real_model}")
+        if self.real_model is None:
+            return False
         return self.real_model() is not None and self.model is None
 
 
@@ -514,47 +548,91 @@ def minimum_inference_memory():
     return (1024 * 1024 * 1024) * 0.8 + extra_reserved_memory()
 
 def free_memory(memory_required, device, keep_loaded=[]):
+    """
+    释放内存以满足内存需求。
+
+    该函数通过卸载模型来释放内存，直到达到所需的内存大小。它会优先卸载那些不在`keep_loaded`列表中的模型。
+
+    参数:
+    - memory_required (int): 需要释放的内存量，以字节为单位。
+    - device (torch.device): 执行设备对象，表示内存需要在哪个设备上释放。
+    - keep_loaded (list): 一个模型列表，这些模型不应该被卸载。
+
+    返回:
+    - unloaded_models (list): 一个卸载的模型列表。
+    """
+    # 清理不再使用的模型
     cleanup_models_gc()
     unloaded_model = []
     can_unload = []
     unloaded_models = []
+    current_loaded_models_on_gpu = get_current_loaded_models()
 
-    for i in range(len(current_loaded_models) -1, -1, -1):
-        shift_model = current_loaded_models[i]
+    # 遍历当前加载的模型，查找可以卸载的模型
+    for i in range(len(current_loaded_models_on_gpu) - 1, -1, -1):
+        shift_model = current_loaded_models_on_gpu[i]
+
+        # 检查模型是否在指定的设备上
         if shift_model.device == device:
+            # 检查模型是否不在保持加载的列表中且模型是否仍然有效
             if shift_model not in keep_loaded and not shift_model.is_dead():
+                # 可以卸载的模型按释放的内存大小排序
                 can_unload.append((-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
                 shift_model.currently_used = False
 
+    # 卸载模型以释放内存
     for x in sorted(can_unload):
         i = x[-1]
         memory_to_free = None
+        # 如果未禁用智能内存管理，则根据需要释放内存
         if not DISABLE_SMART_MEMORY:
             free_mem = get_free_memory(device)
             if free_mem > memory_required:
                 break
             memory_to_free = memory_required - free_mem
-        logging.debug(f"Unloading {current_loaded_models[i].model.model.__class__.__name__}")
-        if current_loaded_models[i].model_unload(memory_to_free):
+        # 记录正在卸载的模型
+        logging.debug(f"Unloading {current_loaded_models_on_gpu[i].model.model.__class__.__name__}")
+        if current_loaded_models_on_gpu[i].model_unload(memory_to_free):
             unloaded_model.append(i)
 
+    # 从当前加载的模型列表中移除已卸载的模型
     for i in sorted(unloaded_model, reverse=True):
-        unloaded_models.append(current_loaded_models.pop(i))
+        unloaded_models.append(current_loaded_models_on_gpu.pop(i))
 
+    # 如果有模型被卸载，则调用软清理缓存
     if len(unloaded_model) > 0:
         soft_empty_cache()
     else:
+        # 如果没有模型被卸载且当前VRAM状态不是高VRAM，则根据内存使用情况决定是否清理缓存
         if vram_state != VRAMState.HIGH_VRAM:
             mem_free_total, mem_free_torch = get_free_memory(device, torch_free_too=True)
             if mem_free_torch > mem_free_total * 0.25:
                 soft_empty_cache()
     return unloaded_models
 
+
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
+    """
+    将模型加载到GPU上，根据需求调整内存使用，必要时卸载其他模型以释放资源。
+
+    参数:
+    models (list): 待加载的模型列表。
+    memory_required (int): 加载模型所需的额外内存，默认为0。
+    force_patch_weights (bool): 是否强制修补模型权重，默认为False。
+    minimum_memory_required (int): 最低内存要求，如果为None，则根据模型计算。
+    force_full_load (bool): 是否强制完全加载模型到GPU上，绕过低VRAM模式。
+
+    返回:
+    无
+    """
+    # 清理不再使用的模型，释放内存
     cleanup_models_gc()
     global vram_state
+    current_loaded_models_on_gpu = get_current_loaded_models()
 
+    # 计算进行推理所需的最小内存
     inference_memory = minimum_inference_memory()
+    # 计算额外需要的内存，确保至少满足最小推理内存或指定的内存需求
     extra_mem = max(inference_memory, memory_required + extra_reserved_memory())
     if minimum_memory_required is None:
         minimum_memory_required = extra_mem
@@ -565,38 +643,46 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
 
     models_to_load = []
 
+    # 遍历需要加载的模型，检查是否已加载以及是否需要调整设备
     for x in models:
         loaded_model = LoadedModel(x)
         try:
-            loaded_model_index = current_loaded_models.index(loaded_model)
+            loaded_model_index = current_loaded_models_on_gpu.index(loaded_model)
         except:
             loaded_model_index = None
 
         if loaded_model_index is not None:
-            loaded = current_loaded_models[loaded_model_index]
-            loaded.currently_used = True
-            models_to_load.append(loaded)
+            loaded = current_loaded_models_on_gpu[loaded_model_index]
+            if loaded.device != get_torch_device():
+                loaded.currently_used = True
+                models_to_load.append(loaded)
+            else:
+                models_to_load.append(loaded_model)
         else:
             if hasattr(x, "model"):
                 logging.info(f"Requested to load {x.model.__class__.__name__}")
             models_to_load.append(loaded_model)
 
+    # 卸载与待加载模型重复的模型，避免重复加载
     for loaded_model in models_to_load:
         to_unload = []
-        for i in range(len(current_loaded_models)):
-            if loaded_model.model.is_clone(current_loaded_models[i].model):
+        for i in range(len(current_loaded_models_on_gpu)):
+            if loaded_model.model.is_clone(current_loaded_models_on_gpu[i].model):
                 to_unload = [i] + to_unload
         for i in to_unload:
-            current_loaded_models.pop(i).model.detach(unpatch_all=False)
+            current_loaded_models_on_gpu.pop(i).model.detach(unpatch_all=False)
 
+    # 计算每个设备上加载模型所需的总内存
     total_memory_required = {}
     for loaded_model in models_to_load:
         total_memory_required[loaded_model.device] = total_memory_required.get(loaded_model.device, 0) + loaded_model.model_memory_required(loaded_model.device)
 
+    # 为每个非CPU设备释放足够的内存以满足模型加载需求
     for device in total_memory_required:
         if device != torch.device("cpu"):
             free_memory(total_memory_required[device] * 1.1 + extra_mem, device)
 
+    # 确保每个非CPU设备上有足够的自由内存，否则卸载部分模型
     for device in total_memory_required:
         if device != torch.device("cpu"):
             free_mem = get_free_memory(device)
@@ -604,6 +690,7 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
                 models_l = free_memory(minimum_memory_required, device)
                 logging.info("{} models unloaded.".format(len(models_l)))
 
+    # 加载模型到各自的设备上，根据设备状态和内存情况决定加载策略
     for loaded_model in models_to_load:
         model = loaded_model.model
         torch_dev = model.load_device
@@ -623,15 +710,17 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             lowvram_model_memory = 0.1
 
         loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
-        current_loaded_models.insert(0, loaded_model)
+        current_loaded_models_on_gpu.insert(0, loaded_model)
     return
+
 
 def load_model_gpu(model):
     return load_models_gpu([model])
 
 def loaded_models(only_currently_used=False):
     output = []
-    for m in current_loaded_models:
+    current_loaded_models_on_gpu = get_current_loaded_models()
+    for m in current_loaded_models_on_gpu:
         if only_currently_used:
             if not m.currently_used:
                 continue
@@ -641,33 +730,51 @@ def loaded_models(only_currently_used=False):
 
 
 def cleanup_models_gc():
+    """
+    检查当前加载的模型是否有潜在的内存泄漏，并在必要时进行垃圾回收。
+    此函数旨在释放未被正确释放的模型所占用的内存，以避免内存泄漏影响程序性能。
+    """
+    # 初始化是否需要进行垃圾回收的标志
     do_gc = False
-    for i in range(len(current_loaded_models)):
-        cur = current_loaded_models[i]
-        if cur.is_dead():
-            logging.info("Potential memory leak detected with model {}, doing a full garbage collect, for maximum performance avoid circular references in the model code.".format(cur.real_model().__class__.__name__))
-            do_gc = True
-            break
+    current_loaded_models_on_gpu = get_current_loaded_models()
+    # 遍历当前加载的模型，检查每个模型是否有内存泄漏
+    for i in range(len(current_loaded_models_on_gpu)):
+        cur = current_loaded_models_on_gpu[i]
+        # 检查模型是否在当前使用的设备上
+        if cur.device == get_torch_device():
+            # 检查模型是否已经不再使用（已死亡）
+            if cur.is_dead():
+                # 如果检测到潜在的内存泄漏，记录日志并设置垃圾回收标志
+                logging.info("Potential memory leak detected with model {}, doing a full garbage collect, for maximum performance avoid circular references in the model code.".format(cur.real_model().__class__.__name__))
+                do_gc = True
+                break
 
+    # 如果需要进行垃圾回收
     if do_gc:
+        # 执行垃圾回收和清空缓存，以释放内存
         gc.collect()
         soft_empty_cache()
 
-        for i in range(len(current_loaded_models)):
-            cur = current_loaded_models[i]
-            if cur.is_dead():
-                logging.warning("WARNING, memory leak with model {}. Please make sure it is not being referenced from somewhere.".format(cur.real_model().__class__.__name__))
+        # 再次遍历当前加载的模型，检查模型是否仍然有内存泄漏
+        for i in range(len(current_loaded_models_on_gpu)):
+            cur = current_loaded_models_on_gpu[i]
+            if cur.device == get_torch_device():
+                if cur.is_dead():
+                    # 如果模型仍然无法释放，发出警告日志
+                    logging.warning("WARNING, memory leak with model {}. Please make sure it is not being referenced from somewhere.".format(cur.real_model().__class__.__name__))
+
 
 
 
 def cleanup_models():
     to_delete = []
-    for i in range(len(current_loaded_models)):
-        if current_loaded_models[i].real_model() is None:
+    current_loaded_models_on_gpu = get_current_loaded_models()
+    for i in range(len(current_loaded_models_on_gpu)):
+        if current_loaded_models_on_gpu[i].real_model() is None:
             to_delete = [i] + to_delete
 
     for i in to_delete:
-        x = current_loaded_models.pop(i)
+        x = current_loaded_models_on_gpu.pop(i)
         del x
 
 def dtype_size(dtype):
