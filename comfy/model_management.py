@@ -480,6 +480,20 @@ except:
 
 current_loaded_models = []
 
+current_loaded_models_by_gpu = []
+
+def get_current_loaded_models(device=None):
+    if device is None:
+        device = get_torch_device()
+
+    if len(current_loaded_models_by_gpu) < device.index + 1:
+        current_loaded_models_by_gpu.append([])
+    return current_loaded_models_by_gpu[device.index]
+
+def set_current_loaded_models(device, models):
+    current_loaded_models_by_gpu[device.index] = models
+
+
 def module_size(module):
     module_mem = 0
     sd = module.state_dict()
@@ -575,6 +589,8 @@ class LoadedModel:
             self._patcher_finalizer.detach()
 
     def is_dead(self):
+        if self.real_model is None:
+            return False
         return self.real_model() is not None and self.model is None
 
 
@@ -621,9 +637,12 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, ram_
     unloaded_model = []
     can_unload = []
     unloaded_models = []
+    current_loaded_models_on_gpu = get_current_loaded_models()
 
-    for i in range(len(current_loaded_models) -1, -1, -1):
-        shift_model = current_loaded_models[i]
+    # 遍历当前加载的模型，查找可以卸载的模型
+    for i in range(len(current_loaded_models_on_gpu) - 1, -1, -1):
+        shift_model = current_loaded_models_on_gpu[i]
+
         if shift_model.device == device:
             if shift_model not in keep_loaded and not shift_model.is_dead():
                 can_unload.append((-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
@@ -641,7 +660,7 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, ram_
                 #as that works on-demand.
                 memory_required -= current_loaded_models[i].model.loaded_size()
                 memory_to_free = 0
-        if memory_to_free > 0 and current_loaded_models[i].model_unload(memory_to_free):
+        if memory_to_free > 0 and current_loaded_models_on_gpu[i].model_unload(memory_to_free):
             logging.debug(f"Unloading {current_loaded_models[i].model.model.__class__.__name__}")
             unloaded_model.append(i)
         if ram_to_free > 0:
@@ -649,7 +668,7 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, ram_
             current_loaded_models[i].model.partially_unload_ram(ram_to_free)
 
     for i in sorted(unloaded_model, reverse=True):
-        unloaded_models.append(current_loaded_models.pop(i))
+        unloaded_models.append(current_loaded_models_on_gpu.pop(i))
 
     if len(unloaded_model) > 0:
         soft_empty_cache()
@@ -663,6 +682,7 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, ram_
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
     cleanup_models_gc()
     global vram_state
+    current_loaded_models_on_gpu = get_current_loaded_models()
 
     inference_memory = minimum_inference_memory()
     extra_mem = max(inference_memory, memory_required + extra_reserved_memory())
@@ -687,14 +707,18 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             free_for_dynamic = False
         loaded_model = LoadedModel(x)
         try:
-            loaded_model_index = current_loaded_models.index(loaded_model)
+            loaded_model_index = current_loaded_models_on_gpu.index(loaded_model)
         except:
             loaded_model_index = None
 
         if loaded_model_index is not None:
-            loaded = current_loaded_models[loaded_model_index]
-            loaded.currently_used = True
-            models_to_load.append(loaded)
+            loaded = current_loaded_models_on_gpu[loaded_model_index]
+            if loaded.device != get_torch_device():
+                loaded.currently_used = True
+                models_to_load.append(loaded)
+            else:
+                models_to_load.append(loaded_model)
+
         else:
             if hasattr(x, "model"):
                 logging.info(f"Requested to load {x.model.__class__.__name__}")
@@ -702,11 +726,11 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
 
     for loaded_model in models_to_load:
         to_unload = []
-        for i in range(len(current_loaded_models)):
-            if loaded_model.model.is_clone(current_loaded_models[i].model):
+        for i in range(len(current_loaded_models_on_gpu)):
+            if loaded_model.model.is_clone(current_loaded_models_on_gpu[i].model):
                 to_unload = [i] + to_unload
         for i in to_unload:
-            model_to_unload = current_loaded_models.pop(i)
+            model_to_unload = current_loaded_models_on_gpu.pop(i)
             model_to_unload.model.detach(unpatch_all=False)
             model_to_unload.model_finalizer.detach()
 
@@ -753,7 +777,7 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             lowvram_model_memory = 0.1
 
         loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
-        current_loaded_models.insert(0, loaded_model)
+        current_loaded_models_on_gpu.insert(0, loaded_model)
     return
 
 def load_model_gpu(model):
@@ -761,7 +785,8 @@ def load_model_gpu(model):
 
 def loaded_models(only_currently_used=False):
     output = []
-    for m in current_loaded_models:
+    current_loaded_models_on_gpu = get_current_loaded_models()
+    for m in current_loaded_models_on_gpu:
         if only_currently_used:
             if not m.currently_used:
                 continue
@@ -772,24 +797,27 @@ def loaded_models(only_currently_used=False):
 
 def cleanup_models_gc():
     do_gc = False
+    current_loaded_models_on_gpu = get_current_loaded_models()
 
     reset_cast_buffers()
 
-    for i in range(len(current_loaded_models)):
-        cur = current_loaded_models[i]
-        if cur.is_dead():
-            logging.info("Potential memory leak detected with model {}, doing a full garbage collect, for maximum performance avoid circular references in the model code.".format(cur.real_model().__class__.__name__))
-            do_gc = True
-            break
+    for i in range(len(current_loaded_models_on_gpu)):
+        cur = current_loaded_models_on_gpu[i]
+        if cur.device == get_torch_device():
+            if cur.is_dead():
+                logging.info("Potential memory leak detected with model {}, doing a full garbage collect, for maximum performance avoid circular references in the model code.".format(cur.real_model().__class__.__name__))
+                do_gc = True
+                break
 
     if do_gc:
         gc.collect()
         soft_empty_cache()
 
-        for i in range(len(current_loaded_models)):
-            cur = current_loaded_models[i]
-            if cur.is_dead():
-                logging.warning("WARNING, memory leak with model {}. Please make sure it is not being referenced from somewhere.".format(cur.real_model().__class__.__name__))
+        for i in range(len(current_loaded_models_on_gpu)):
+            cur = current_loaded_models_on_gpu[i]
+            if cur.device == get_torch_device():
+                if cur.is_dead():
+                    logging.warning("WARNING, memory leak with model {}. Please make sure it is not being referenced from somewhere.".format(cur.real_model().__class__.__name__))
 
 
 def archive_model_dtypes(model):
@@ -802,12 +830,14 @@ def archive_model_dtypes(model):
 
 def cleanup_models():
     to_delete = []
-    for i in range(len(current_loaded_models)):
-        if current_loaded_models[i].real_model() is None:
+    current_loaded_models_on_gpu = get_current_loaded_models()
+
+    for i in range(len(current_loaded_models_on_gpu)):
+        if current_loaded_models_on_gpu[i].real_model() is None:
             to_delete = [i] + to_delete
 
     for i in to_delete:
-        x = current_loaded_models.pop(i)
+        x = current_loaded_models_on_gpu.pop(i)
         del x
 
 def dtype_size(dtype):

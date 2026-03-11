@@ -208,6 +208,8 @@ def get_input_data(inputs, class_def, unique_id, execution_list=None, dynprompt=
                     input_data_all[x] = [extra_data.get('extra_pnginfo', None)]
                 if h[x] == "UNIQUE_ID":
                     input_data_all[x] = [unique_id]
+                if h[x] == "PROMPT_ID":
+                    input_data_all[x] = [extra_data.get('prompt_id', None)]
                 if h[x] == "AUTH_TOKEN_COMFY_ORG":
                     input_data_all[x] = [extra_data.get("auth_token_comfy_org", None)]
                 if h[x] == "API_KEY_COMFY_ORG":
@@ -411,6 +413,15 @@ def format_value(x):
         return str(x)
 
 async def execute(server, dynprompt, caches, current_item, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_outputs):
+    # 补充 prompt_id、client_id
+    extra_data['prompt_id'] = prompt_id
+    client_id = None
+    if extra_data['client_id'] is not None:
+        client_id = extra_data['client_id']
+
+    if client_id is None and server.client_id is not None:
+        client_id = server.client_id
+
     unique_id = current_item
     real_node_id = dynprompt.get_real_node_id(unique_id)
     display_node_id = dynprompt.get_display_node_id(unique_id)
@@ -420,9 +431,11 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
     class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
     cached = caches.outputs.get(unique_id)
     if cached is not None:
-        if server.client_id is not None:
+        # if server.client_id is not None:
+        if client_id is not None:
             cached_ui = cached.ui or {}
-            server.send_sync("executed", { "node": unique_id, "display_node": display_node_id, "output": cached_ui.get("output",None), "prompt_id": prompt_id }, server.client_id)
+            server.send_sync("executed", { "node": unique_id, "display_node": display_node_id,
+                                           "output": cached_ui.get("output",None), "prompt_id": prompt_id }, client_id)
             if cached.ui is not None:
                 ui_outputs[unique_id] = cached.ui
         get_progress_state().finish_progress(unique_id)
@@ -470,9 +483,9 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
         else:
             get_progress_state().start_progress(unique_id)
             input_data_all, missing_keys, v3_data = get_input_data(inputs, class_def, unique_id, execution_list, dynprompt, extra_data)
-            if server.client_id is not None:
+            if client_id is not None:
                 server.last_node_id = display_node_id
-                server.send_sync("executing", { "node": unique_id, "display_node": display_node_id, "prompt_id": prompt_id }, server.client_id)
+                server.send_sync("executing", { "node": unique_id, "display_node": display_node_id, "prompt_id": prompt_id }, client_id)
 
             obj = caches.objects.get(unique_id)
             if obj is None:
@@ -512,7 +525,7 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
                         "current_inputs": [],
                         "current_outputs": [],
                     }
-                    server.send_sync("execution_error", mes, server.client_id)
+                    server.send_sync("execution_error", mes, client_id)
                     return ExecutionBlocker(None)
                 else:
                     return block
@@ -548,8 +561,8 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
                 },
                 "output": output_ui
             }
-            if server.client_id is not None:
-                server.send_sync("executed", { "node": unique_id, "display_node": display_node_id, "output": output_ui, "prompt_id": prompt_id }, server.client_id)
+            if client_id is not None:
+                server.send_sync("executed", { "node": unique_id, "display_node": display_node_id, "output": output_ui, "prompt_id": prompt_id }, client_id)
         if has_subgraph:
             cached_outputs = []
             new_node_ids = []
@@ -636,10 +649,12 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
     return (ExecutionResult.SUCCESS, None, None)
 
 class PromptExecutor:
+    client_id: str
     def __init__(self, server, cache_type=False, cache_args=None):
         self.cache_args = cache_args
         self.cache_type = cache_type
         self.server = server
+        self.client_id = self.server.client_id
         self.reset()
 
     def reset(self):
@@ -694,6 +709,7 @@ class PromptExecutor:
 
         if "client_id" in extra_data:
             self.server.client_id = extra_data["client_id"]
+            self.client_id = extra_data["client_id"]
         else:
             self.server.client_id = None
 

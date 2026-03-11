@@ -1,3 +1,5 @@
+import torch
+
 import comfy.options
 comfy.options.enable_args_parsing()
 
@@ -226,7 +228,7 @@ def cuda_malloc_warning():
             logging.warning("\nWARNING: this card most likely does not support cuda-malloc, if you get \"CUDA error\" please run ComfyUI with: --disable-cuda-malloc\n")
 
 
-def prompt_worker(q, server_instance):
+def prompt_worker(q, server_instance, gpu_id):
     current_time: float = 0.0
     cache_type = execution.CacheType.CLASSIC
     if args.cache_lru > 0:
@@ -240,6 +242,10 @@ def prompt_worker(q, server_instance):
     last_gc_collect = 0
     need_gc = False
     gc_collect_interval = 10.0
+
+    # 为多gpu环境设置运行时GPU
+    if torch.cuda.is_available():
+        torch.cuda.set_device(gpu_id)
 
     while True:
         timeout = 1000.0
@@ -255,6 +261,8 @@ def prompt_worker(q, server_instance):
 
             sensitive = item[5]
             extra_data = item[3].copy()
+            client_id = extra_data['client_id']
+
             for k in sensitive:
                 extra_data[k] = sensitive[k]
 
@@ -268,8 +276,8 @@ def prompt_worker(q, server_instance):
                             status_str='success' if e.success else 'error',
                             completed=e.success,
                             messages=e.status_messages), process_item=remove_sensitive)
-            if server_instance.client_id is not None:
-                server_instance.send_sync("executing", {"node": None, "prompt_id": prompt_id}, server_instance.client_id)
+            if client_id is not None:
+                server_instance.send_sync("executing", {"node": None, "prompt_id": prompt_id}, client_id)
 
             current_time = time.perf_counter()
             execution_time = current_time - execution_start_time
@@ -400,7 +408,8 @@ def start_comfyui(asyncio_loop=None):
     prompt_server.add_routes()
     hijack_progress(prompt_server)
 
-    threading.Thread(target=prompt_worker, daemon=True, args=(prompt_server.prompt_queue, prompt_server,)).start()
+    threading.Thread(target=prompt_worker, daemon=True, args=(prompt_server.prompt_queue, prompt_server, 0,)).start()
+    threading.Thread(target=prompt_worker, daemon=True, args=(prompt_server.prompt_queue, prompt_server, 1,)).start()
 
     if args.quick_test_for_ci:
         exit(0)
