@@ -22,6 +22,7 @@ import logging
 from enum import Enum
 from comfy.cli_args import args, PerformanceFeature
 import threading
+import contextvars
 import torch
 import sys
 import platform
@@ -609,6 +610,9 @@ except:
     pass
 
 current_loaded_models: list[LoadedModel] = []
+# Guards mutation of current_loaded_models so concurrent prompt workers (one per
+# GPU) can load/free models without corrupting the shared registry.
+_loaded_models_lock = threading.RLock()
 
 DIRTY_MMAPS = set()
 
@@ -637,14 +641,18 @@ PIN_SUBSETS = [ "weights", "patches" ]
 LOADED_PIN_SUBSETS = [ "weights-loaded", "patches-loaded" ]
 
 def models_for_pin_eviction(active, current_prompt=None):
-    for loaded_model in current_loaded_models:
-        model = loaded_model.model
-        if model is None or not model.is_dynamic():
-            continue
-        pin_state = model.model.dynamic_pins[model.load_device]
-        if ((active is None or pin_state["active"] == active) and
-            (current_prompt is None or pin_state["current_prompt"] == current_prompt)):
-            yield model
+    with _loaded_models_lock:
+        candidates = []
+        for loaded_model in current_loaded_models:
+            model = loaded_model.model
+            if model is None or not model.is_dynamic():
+                continue
+            pin_state = model.model.dynamic_pins[model.load_device]
+            if ((active is None or pin_state["active"] == active) and
+                (current_prompt is None or pin_state["current_prompt"] == current_prompt)):
+                candidates.append(model)
+    for model in candidates:
+        yield model
 
 def free_model_pins(size, subsets, current_prompt, active, registrations=False):
     freed_total = 0
@@ -860,42 +868,43 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, pins
     can_unload = []
     unloaded_models = []
 
-    for i in range(len(current_loaded_models) -1, -1, -1):
-        shift_model = current_loaded_models[i]
-        if device is None or shift_model.device == device:
-            if shift_model not in keep_loaded and not shift_model.is_dead():
-                can_unload.append((-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
-                shift_model.currently_used = False
+    with _loaded_models_lock:
+        for i in range(len(current_loaded_models) -1, -1, -1):
+            shift_model = current_loaded_models[i]
+            if device is None or shift_model.device == device:
+                if shift_model not in keep_loaded and not shift_model.is_dead():
+                    can_unload.append((-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
+                    shift_model.currently_used = False
 
-    can_unload_sorted = sorted(can_unload)
-    for x in can_unload_sorted:
-        i = x[-1]
-        memory_to_free = 1e32
-        if not DISABLE_SMART_MEMORY or device is None:
-            memory_to_free = 0 if device is None else memory_required - get_free_memory(device)
-            if current_loaded_models[i].model.is_dynamic() and for_dynamic:
-                #don't actually unload dynamic models for the sake of other dynamic models
-                #as that works on-demand.
-                memory_required -= current_loaded_models[i].model.loaded_size()
-                memory_to_free = 0
-        if memory_to_free > 0 and current_loaded_models[i].model_unload(memory_to_free):
-            logging.debug(f"Unloading {current_loaded_models[i].model.model.__class__.__name__}")
-            unloaded_model.append(i)
+        can_unload_sorted = sorted(can_unload)
+        for x in can_unload_sorted:
+            i = x[-1]
+            memory_to_free = 1e32
+            if not DISABLE_SMART_MEMORY or device is None:
+                memory_to_free = 0 if device is None else memory_required - get_free_memory(device)
+                if current_loaded_models[i].model.is_dynamic() and for_dynamic:
+                    #don't actually unload dynamic models for the sake of other dynamic models
+                    #as that works on-demand.
+                    memory_required -= current_loaded_models[i].model.loaded_size()
+                    memory_to_free = 0
+            if memory_to_free > 0 and current_loaded_models[i].model_unload(memory_to_free):
+                logging.debug(f"Unloading {current_loaded_models[i].model.model.__class__.__name__}")
+                unloaded_model.append(i)
 
-    for i in sorted(unloaded_model, reverse=True):
-        unloaded_models.append(current_loaded_models.pop(i))
+        for i in sorted(unloaded_model, reverse=True):
+            unloaded_models.append(current_loaded_models.pop(i))
 
     if not for_dynamic and pins_required > 0:
         ensure_pin_budget(pins_required)
         ensure_pin_registerable(pins_required)
 
     if len(unloaded_model) > 0:
-        soft_empty_cache()
+        soft_empty_cache(device=device)
     elif device is not None:
         if vram_state != VRAMState.HIGH_VRAM:
             mem_free_total, mem_free_torch = get_free_memory(device, torch_free_too=True)
             if mem_free_torch > mem_free_total * 0.25:
-                soft_empty_cache()
+                soft_empty_cache(device=device)
     return unloaded_models
 
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
@@ -922,33 +931,34 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
     models_to_load = []
 
     free_for_dynamic=True
-    for x in models:
-        if not x.is_dynamic():
-            free_for_dynamic = False
-        loaded_model = LoadedModel(x)
-        try:
-            loaded_model_index = current_loaded_models.index(loaded_model)
-        except:
-            loaded_model_index = None
+    with _loaded_models_lock:
+        for x in models:
+            if not x.is_dynamic():
+                free_for_dynamic = False
+            loaded_model = LoadedModel(x)
+            try:
+                loaded_model_index = current_loaded_models.index(loaded_model)
+            except:
+                loaded_model_index = None
 
-        if loaded_model_index is not None:
-            loaded = current_loaded_models[loaded_model_index]
-            loaded.currently_used = True
-            models_to_load.append(loaded)
-        else:
-            if hasattr(x, "model"):
-                logging.info(f"Requested to load {x.model.__class__.__name__}")
-            models_to_load.append(loaded_model)
+            if loaded_model_index is not None:
+                loaded = current_loaded_models[loaded_model_index]
+                loaded.currently_used = True
+                models_to_load.append(loaded)
+            else:
+                if hasattr(x, "model"):
+                    logging.info(f"Requested to load {x.model.__class__.__name__}")
+                models_to_load.append(loaded_model)
 
-    for loaded_model in models_to_load:
-        to_unload = []
-        for i in range(len(current_loaded_models)):
-            if loaded_model.model.is_clone(current_loaded_models[i].model):
-                to_unload = [i] + to_unload
-        for i in to_unload:
-            model_to_unload = current_loaded_models.pop(i)
-            model_to_unload.model.detach(unpatch_all=False)
-            model_to_unload.model_finalizer.detach()
+        for loaded_model in models_to_load:
+            to_unload = []
+            for i in range(len(current_loaded_models)):
+                if loaded_model.model.is_clone(current_loaded_models[i].model):
+                    to_unload = [i] + to_unload
+            for i in to_unload:
+                model_to_unload = current_loaded_models.pop(i)
+                model_to_unload.model.detach(unpatch_all=False)
+                model_to_unload.model_finalizer.detach()
 
     total_memory_required = {}
     total_pins_required = {}
@@ -997,7 +1007,8 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
         vram_used = 0 if is_device_cpu(torch_dev) else loaded_model.model_loaded_memory()
         ram_used = model.loaded_ram_size() if model.is_dynamic() else loaded_model.model_memory() - vram_used
         detail("Model loaded: patcher=%s model=%s ram_mb=%.1f vram_mb=%.1f", model.__class__.__name__, model.model.__class__.__name__, ram_used / (1024 ** 2), vram_used / (1024 ** 2))
-        current_loaded_models.insert(0, loaded_model)
+        with _loaded_models_lock:
+            current_loaded_models.insert(0, loaded_model)
     return
 
 def load_model_gpu(model):
@@ -1005,33 +1016,36 @@ def load_model_gpu(model):
 
 def loaded_models(only_currently_used=False):
     output = []
-    for m in current_loaded_models:
-        if only_currently_used:
-            if not m.currently_used:
-                continue
+    with _loaded_models_lock:
+        for m in current_loaded_models:
+            if only_currently_used:
+                if not m.currently_used:
+                    continue
 
-        output.append(m.model)
+            output.append(m.model)
     return output
 
 
 def cleanup_models_gc():
     do_gc = False
 
-    for i in range(len(current_loaded_models)):
-        cur = current_loaded_models[i]
-        if cur.is_dead():
-            logging.info("Potential memory leak detected with model {}, doing a full garbage collect, for maximum performance avoid circular references in the model code.".format(cur.real_model().__class__.__name__))
-            do_gc = True
-            break
+    with _loaded_models_lock:
+        for i in range(len(current_loaded_models)):
+            cur = current_loaded_models[i]
+            if cur.is_dead():
+                logging.info("Potential memory leak detected with model {}, doing a full garbage collect, for maximum performance avoid circular references in the model code.".format(cur.real_model().__class__.__name__))
+                do_gc = True
+                break
 
     if do_gc:
         gc.collect()
         soft_empty_cache()
 
-        for i in range(len(current_loaded_models)):
-            cur = current_loaded_models[i]
-            if cur.is_dead():
-                logging.warning("WARNING, memory leak with model {}. Please make sure it is not being referenced from somewhere.".format(cur.real_model().__class__.__name__))
+        with _loaded_models_lock:
+            for i in range(len(current_loaded_models)):
+                cur = current_loaded_models[i]
+                if cur.is_dead():
+                    logging.warning("WARNING, memory leak with model {}. Please make sure it is not being referenced from somewhere.".format(cur.real_model().__class__.__name__))
 
 
 def archive_model_dtypes(model):
@@ -1044,13 +1058,14 @@ def archive_model_dtypes(model):
 
 def cleanup_models():
     to_delete = []
-    for i in range(len(current_loaded_models)):
-        if current_loaded_models[i].real_model() is None:
-            to_delete = [i] + to_delete
+    with _loaded_models_lock:
+        for i in range(len(current_loaded_models)):
+            if current_loaded_models[i].real_model() is None:
+                to_delete = [i] + to_delete
 
-    for i in to_delete:
-        x = current_loaded_models.pop(i)
-        del x
+        for i in to_delete:
+            x = current_loaded_models.pop(i)
+            del x
 
 def dtype_size(dtype):
     dtype_size = 4
@@ -1417,7 +1432,9 @@ def reset_cast_buffers():
         mmap_obj.bounce()
     DIRTY_MMAPS.clear()
 
-    for loaded_model in current_loaded_models:
+    with _loaded_models_lock:
+        loaded_snapshot = list(current_loaded_models)
+    for loaded_model in loaded_snapshot:
         model = loaded_model.model
         if model is not None and model.is_dynamic():
             pin_state = model.model.dynamic_pins[model.load_device]
@@ -2014,29 +2031,29 @@ def lora_compute_dtype(device):
     LORA_COMPUTE_DTYPES[device] = dtype
     return dtype
 
-def synchronize():
+def synchronize(device=None):
     if cpu_mode():
         return
     if is_intel_xpu():
-        torch.xpu.synchronize()
+        torch.xpu.synchronize(device)
     elif torch.cuda.is_available():
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
 
-def soft_empty_cache(force=False):
+def soft_empty_cache(force=False, device=None):
     if cpu_mode():
         return
     global cpu_state
     if cpu_state == CPUState.MPS:
         torch.mps.empty_cache()
     elif is_intel_xpu():
-        torch.xpu.synchronize()
+        torch.xpu.synchronize(device)
         torch.xpu.empty_cache()
     elif is_ascend_npu():
         torch.npu.empty_cache()
     elif is_mlu():
         torch.mlu.empty_cache()
     elif torch.cuda.is_available():
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
@@ -2046,7 +2063,8 @@ def unload_all_models():
 
 def unload_model_and_clones(model: ModelPatcher, unload_additional_models=True, all_devices=False):
     'Unload only model and its clones - primarily for multigpu cloning purposes.'
-    initial_keep_loaded: list[LoadedModel] = current_loaded_models.copy()
+    with _loaded_models_lock:
+        initial_keep_loaded: list[LoadedModel] = current_loaded_models.copy()
     additional_models = []
     if unload_additional_models:
         additional_models = model.get_nested_additional_models()
@@ -2087,11 +2105,36 @@ def interrupt_current_processing(value=True):
     with interrupt_processing_mutex:
         interrupt_processing = value
 
+# Per-worker interrupt flag for parallel prompt execution. Each prompt worker
+# thread binds its own flag via bind_task_interrupt_flag(); interrupting a
+# single prompt sets that flag instead of the global one, so parallel prompts
+# on other GPUs are unaffected. Falls back to the global flag when no task
+# flag is bound (single-worker / legacy path).
+_task_interrupt_state = threading.local()
+def bind_task_interrupt_flag(flag):
+    """Bind a mutable flag object (with a .interrupted bool) to the current thread."""
+    _task_interrupt_state.flag = flag
+
+def _task_interrupted():
+    flag = getattr(_task_interrupt_state, "flag", None)
+    return flag is not None and flag.interrupted
+
+def interrupt_current_task(flag):
+    """Set a specific task flag (called cross-thread by the parallel executor)."""
+    flag.interrupted = True
+
+def reset_current_task_interrupt():
+    flag = getattr(_task_interrupt_state, "flag", None)
+    if flag is not None:
+        flag.interrupted = False
+
 def processing_interrupted():
     global interrupt_processing
     global interrupt_processing_mutex
     with interrupt_processing_mutex:
-        return interrupt_processing
+        if interrupt_processing:
+            return True
+    return _task_interrupted()
 
 def throw_exception_if_processing_interrupted():
     global interrupt_processing
@@ -2100,3 +2143,5 @@ def throw_exception_if_processing_interrupted():
         if interrupt_processing:
             interrupt_processing = False
             raise InterruptProcessingException()
+    if _task_interrupted():
+        raise InterruptProcessingException()

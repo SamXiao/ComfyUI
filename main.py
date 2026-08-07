@@ -326,8 +326,7 @@ def _collect_output_absolute_paths(history_result: dict) -> list[str]:
     return paths
 
 
-def prompt_worker(q, server_instance):
-    current_time: float = 0.0
+def _make_executor(server_instance):
     cache_ram = 0
     cache_ram_inactive = 0
     if not args.cache_classic and not args.cache_none and args.cache_lru <= 0:
@@ -346,10 +345,38 @@ def prompt_worker(q, server_instance):
     elif args.cache_none:
         cache_type = execution.CacheType.NONE
 
-    e = execution.PromptExecutor(server_instance, cache_type=cache_type, cache_args={ "lru" : args.cache_lru, "ram" : cache_ram, "ram_inactive" : cache_ram_inactive } )
+    return execution.PromptExecutor(server_instance, cache_type=cache_type, cache_args={ "lru" : args.cache_lru, "ram" : cache_ram, "ram_inactive" : cache_ram_inactive })
+
+
+def _device_for_prompt(item, worker_device):
+    """Return the device this prompt is pinned to, or None for any device.
+
+    extra_data["device"] may be "gpu:N" (matching resolve_gpu_device_option).
+    If it pins the prompt to a device other than the worker's, the worker
+    declines and requeues.
+    """
+    extra_data = item[3]
+    requested = extra_data.get("device") if isinstance(extra_data, dict) else None
+    if not requested or requested == "default":
+        return None
+    try:
+        return comfy.model_management.resolve_gpu_device_option(requested)
+    except Exception:
+        return None
+
+
+def _run_prompt_loop(q, server_instance, e, worker_device=None, parallel_executor=None, worker_state=None):
+    """Shared prompt-execution loop for both single- and multi-GPU workers.
+
+    When parallel_executor is set, per-task interrupt flags are bound/unbound
+    via the executor so /interrupt can target a single prompt. worker_device,
+    when set, enables device-affinity filtering: prompts pinned to a different
+    GPU are put back for the right worker to claim.
+    """
     last_gc_collect = 0
     need_gc = False
     gc_collect_interval = 10.0
+    current_time: float = 0.0
 
     while True:
         timeout = 1000.0
@@ -359,8 +386,24 @@ def prompt_worker(q, server_instance):
         queue_item = q.get(timeout=timeout)
         if queue_item is not None:
             item, item_id = queue_item
-            execution_start_time = time.perf_counter()
+
+            if worker_device is not None and parallel_executor is not None:
+                requested = _device_for_prompt(item, worker_device)
+                if requested is not None and requested != worker_device:
+                    # Pinned to another device. Only decline if a worker is
+                    # actually bound to that device; otherwise (e.g. fewer
+                    # workers than GPUs) claim it here so the prompt is not
+                    # stuck requeueing forever.
+                    if requested in parallel_executor.worker_devices:
+                        q.requeue(item_id)
+                        time.sleep(0.05)
+                        continue
+
             prompt_id = item[1]
+            if parallel_executor is not None and worker_state is not None:
+                parallel_executor.assign_prompt(prompt_id, worker_state)
+
+            execution_start_time = time.perf_counter()
             server_instance.last_prompt_id = prompt_id
 
             sensitive = item[5]
@@ -369,7 +412,11 @@ def prompt_worker(q, server_instance):
                 extra_data[k] = sensitive[k]
 
             asset_seeder.pause()
-            e.execute(item[2], prompt_id, extra_data, item[4])
+            try:
+                e.execute(item[2], prompt_id, extra_data, item[4])
+            finally:
+                if parallel_executor is not None and worker_state is not None:
+                    parallel_executor.finish_prompt(prompt_id, worker_state)
 
             need_gc = True
 
@@ -380,8 +427,10 @@ def prompt_worker(q, server_instance):
                             status_str='success' if e.success else 'error',
                             completed=e.success,
                             messages=e.status_messages), process_item=remove_sensitive)
-            if server_instance.client_id is not None:
-                server_instance.send_sync("executing", {"node": None, "prompt_id": prompt_id}, server_instance.client_id)
+            prompt_ctx = execution.get_prompt_context()
+            client_id = prompt_ctx.client_id if prompt_ctx is not None else server_instance.client_id
+            if client_id is not None:
+                server_instance.send_sync("executing", {"node": None, "prompt_id": prompt_id}, client_id)
 
             current_time = time.perf_counter()
             execution_time = current_time - execution_start_time
@@ -397,10 +446,17 @@ def prompt_worker(q, server_instance):
                 paths = _collect_output_absolute_paths(e.history_result)
                 register_output_files(paths, job_id=prompt_id)
 
-        flags = q.get_flags()
-        free_memory = flags.get("free_memory", False)
+        if parallel_executor is not None:
+            free_memory = q.consume_flag_for_worker("free_memory")
+            unload_models = q.consume_flag_for_worker("unload_models")
+            if unload_models is None:
+                unload_models = free_memory
+        else:
+            flags = q.get_flags()
+            free_memory = flags.get("free_memory", False)
+            unload_models = flags.get("unload_models", free_memory)
 
-        if flags.get("unload_models", free_memory):
+        if unload_models:
             comfy.model_management.unload_all_models()
             need_gc = True
             last_gc_collect = 0
@@ -424,6 +480,58 @@ def prompt_worker(q, server_instance):
                 asset_seeder.resume()
 
 
+def prompt_worker(q, server_instance):
+    e = _make_executor(server_instance)
+    _run_prompt_loop(q, server_instance, e)
+
+
+def _start_prompt_workers(prompt_server):
+    """Start prompt execution workers.
+
+    With more than one visible GPU (and parallel execution enabled), one
+    worker thread is spawned per GPU via ParallelPromptExecutor so independent
+    prompts run concurrently on separate devices. Otherwise a single worker
+    thread runs the legacy serial path.
+
+    --parallel-workers N overrides the worker count: N < GPU count uses only
+    the first N GPUs; N > GPU count lets workers share GPUs (bounded by VRAM).
+    """
+    devices = comfy.model_management.get_all_torch_devices()
+    # parallel_execution is None (auto) by default: enable when >1 GPU.
+    # Explicitly disabled via --no-parallel-execution. An explicit
+    # --parallel-workers N also forces the parallel path on (e.g. to run
+    # multiple workers sharing a single GPU).
+    forced = args.parallel_workers is not None and args.parallel_workers > 0
+    use_parallel = args.parallel_execution is not False and (forced or len(devices) > 1)
+
+    if not use_parallel:
+        threading.Thread(target=prompt_worker, daemon=True,
+                         args=(prompt_server.prompt_queue, prompt_server)).start()
+        return
+
+    from comfy.parallel_executor import ParallelPromptExecutor
+
+    num_workers = args.parallel_workers
+    if num_workers is not None and num_workers > 0:
+        if num_workers <= len(devices):
+            worker_devices = devices[:num_workers]
+        else:
+            # More workers than GPUs: cycle through devices so workers share.
+            worker_devices = [devices[i % len(devices)] for i in range(num_workers)]
+    else:
+        worker_devices = devices
+
+    def worker_target(device, worker_state, executor):
+        e = _make_executor(prompt_server)
+        _run_prompt_loop(prompt_server.prompt_queue, prompt_server, e,
+                         worker_device=device, parallel_executor=executor,
+                         worker_state=worker_state)
+
+    parallel_executor = ParallelPromptExecutor(worker_devices, worker_target)
+    prompt_server.parallel_executor = parallel_executor
+    logging.info(f"Parallel prompt execution enabled: {parallel_executor.num_workers} workers on {worker_devices}", extra={'color': 'cyan'})
+
+
 async def run(server_instance, address='', port=8188, verbose=True, call_on_start=None):
     addresses = []
     for addr in address.split(","):
@@ -440,25 +548,27 @@ def hijack_progress(server_instance):
         if node_id is None and executing_context is not None:
             node_id = executing_context.node_id
         comfy.model_management.throw_exception_if_processing_interrupted()
+        prompt_ctx = execution.get_prompt_context()
         if prompt_id is None:
             prompt_id = server_instance.last_prompt_id
         if node_id is None:
             node_id = server_instance.last_node_id
+        client_id = prompt_ctx.client_id if prompt_ctx is not None else server_instance.client_id
         progress = {"value": value, "max": total, "prompt_id": prompt_id, "node": node_id}
         get_progress_state().update_progress(node_id, value, total, preview_image)
 
-        server_instance.send_sync("progress", progress, server_instance.client_id)
+        server_instance.send_sync("progress", progress, client_id)
         if preview_image is not None:
             # Only send old method if client doesn't support preview metadata
             if not feature_flags.supports_feature(
                 server_instance.sockets_metadata,
-                server_instance.client_id,
+                client_id,
                 "supports_preview_metadata",
             ):
                 server_instance.send_sync(
                     BinaryEventTypes.UNENCODED_PREVIEW_IMAGE,
                     preview_image,
-                    server_instance.client_id,
+                    client_id,
                 )
 
     comfy.utils.set_progress_bar_global_hook(hook)
@@ -535,7 +645,7 @@ def start_comfyui(asyncio_loop=None):
     prompt_server.add_routes()
     hijack_progress(prompt_server)
 
-    threading.Thread(target=prompt_worker, daemon=True, args=(prompt_server.prompt_queue, prompt_server,)).start()
+    _start_prompt_workers(prompt_server)
 
     if args.quick_test_for_ci:
         exit(0)

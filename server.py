@@ -263,6 +263,7 @@ class PromptServer():
         self.routes = routes
         self.last_node_id = None
         self.client_id = None
+        self.parallel_executor = None
 
         self.on_prompt_handlers = []
 
@@ -1167,25 +1168,36 @@ class PromptServer():
             # Check if a specific prompt_id was provided for targeted interruption
             prompt_id = json_data.get('prompt_id')
             if prompt_id:
-                currently_running, _ = self.prompt_queue.get_current_queue()
-
-                # Check if the prompt_id matches any currently running prompt
-                should_interrupt = False
-                for item in currently_running:
-                    # item structure: (number, prompt_id, prompt, extra_data, outputs_to_execute)
-                    if item[1] == prompt_id:
+                # Prefer per-task interrupt when parallel execution is active, so
+                # only the targeted prompt is stopped and parallel prompts on
+                # other GPUs keep running.
+                if self.parallel_executor is not None:
+                    if self.parallel_executor.interrupt(prompt_id):
                         logging.info(f"Interrupting prompt {prompt_id}")
-                        should_interrupt = True
-                        break
-
-                if should_interrupt:
-                    nodes.interrupt_processing()
+                    else:
+                        logging.info(f"Prompt {prompt_id} is not currently running, skipping interrupt")
                 else:
-                    logging.info(f"Prompt {prompt_id} is not currently running, skipping interrupt")
+                    currently_running, _ = self.prompt_queue.get_current_queue()
+
+                    # Check if the prompt_id matches any currently running prompt
+                    should_interrupt = False
+                    for item in currently_running:
+                        # item structure: (number, prompt_id, prompt, extra_data, outputs_to_execute)
+                        if item[1] == prompt_id:
+                            logging.info(f"Interrupting prompt {prompt_id}")
+                            should_interrupt = True
+                            break
+
+                    if not should_interrupt:
+                        logging.info(f"Prompt {prompt_id} is not currently running, skipping interrupt")
+                    nodes.interrupt_processing()
             else:
                 # No prompt_id provided, do a global interrupt
                 logging.info("Global interrupt (no prompt_id specified)")
-                nodes.interrupt_processing()
+                if self.parallel_executor is not None:
+                    self.parallel_executor.interrupt_all()
+                else:
+                    nodes.interrupt_processing()
 
             return web.Response(status=200)
 
@@ -1194,10 +1206,17 @@ class PromptServer():
             json_data = await request.json()
             unload_models = json_data.get("unload_models", False)
             free_memory = json_data.get("free_memory", False)
+            num_workers = self.parallel_executor.num_workers if self.parallel_executor is not None else 1
             if unload_models:
-                self.prompt_queue.set_flag("unload_models", unload_models)
+                if num_workers > 1:
+                    self.prompt_queue.set_flag_for_workers("unload_models", unload_models, num_workers)
+                else:
+                    self.prompt_queue.set_flag("unload_models", unload_models)
             if free_memory:
-                self.prompt_queue.set_flag("free_memory", free_memory)
+                if num_workers > 1:
+                    self.prompt_queue.set_flag_for_workers("free_memory", free_memory, num_workers)
+                else:
+                    self.prompt_queue.set_flag("free_memory", free_memory)
             return web.Response(status=200)
 
         @routes.post("/history")

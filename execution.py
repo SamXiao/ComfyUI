@@ -1,4 +1,5 @@
 import copy
+import contextvars
 import heapq
 import inspect
 import logging
@@ -56,6 +57,30 @@ class ExecutionResult(Enum):
 
 class DuplicateNodeError(Exception):
     pass
+
+
+class PromptExecutionContext:
+    """Per-prompt execution state. Replaces the single global server.client_id /
+    server.last_node_id so parallel prompt workers do not clobber each other's
+    progress routing. Per-task interrupt is handled by the parallel executor
+    binding a flag to the worker thread via model_management."""
+    def __init__(self, prompt_id):
+        self.prompt_id = prompt_id
+        self.client_id = None
+        self.last_node_id = None
+
+_current_prompt_context: contextvars.ContextVar[Optional[PromptExecutionContext]] = contextvars.ContextVar("_current_prompt_context", default=None)
+
+def get_prompt_context() -> Optional[PromptExecutionContext]:
+    return _current_prompt_context.get()
+
+def _context_client_id(server):
+    """Return the client id for the currently executing prompt, falling back to
+    the server global when no per-prompt context is active (legacy path)."""
+    ctx = _current_prompt_context.get()
+    if ctx is not None:
+        return ctx.client_id
+    return server.client_id
 
 class IsChangedCache:
     def __init__(self, prompt_id: str, dynprompt: DynamicPrompt, outputs_cache: BasicCache):
@@ -430,10 +455,11 @@ def _is_intermediate_output(dynprompt, node_id):
 def _send_cached_ui(server, node_id, display_node_id, cached, prompt_id, ui_outputs):
     if cached.ui is not None:
         ui_outputs[node_id] = cached.ui
-    if server.client_id is None:
+    client_id = _context_client_id(server)
+    if client_id is None:
         return
     cached_ui = cached.ui or {}
-    server.send_sync("executed", { "node": node_id, "display_node": display_node_id, "output": cached_ui.get("output", None), "prompt_id": prompt_id }, server.client_id)
+    server.send_sync("executed", { "node": node_id, "display_node": display_node_id, "output": cached_ui.get("output", None), "prompt_id": prompt_id }, client_id)
 
 async def execute(server, dynprompt, caches, current_item, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_outputs):
     unique_id = current_item
@@ -491,9 +517,14 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
         else:
             get_progress_state().start_progress(unique_id)
             input_data_all, missing_keys, v3_data = get_input_data(inputs, class_def, unique_id, execution_list, dynprompt, extra_data)
-            if server.client_id is not None:
-                server.last_node_id = display_node_id
-                server.send_sync("executing", { "node": unique_id, "display_node": display_node_id, "prompt_id": prompt_id }, server.client_id)
+            client_id = _context_client_id(server)
+            if client_id is not None:
+                ctx = get_prompt_context()
+                if ctx is not None:
+                    ctx.last_node_id = display_node_id
+                else:
+                    server.last_node_id = display_node_id
+                server.send_sync("executing", { "node": unique_id, "display_node": display_node_id, "prompt_id": prompt_id }, client_id)
 
             obj = await caches.objects.get(unique_id)
             if obj is None:
@@ -533,7 +564,7 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
                         "current_inputs": [],
                         "current_outputs": [],
                     }
-                    server.send_sync("execution_error", mes, server.client_id)
+                    server.send_sync("execution_error", mes, _context_client_id(server))
                     return ExecutionBlocker(None)
                 else:
                     return block
@@ -574,8 +605,8 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
                 },
                 "output": output_ui
             }
-            if server.client_id is not None:
-                server.send_sync("executed", { "node": unique_id, "display_node": display_node_id, "output": output_ui, "prompt_id": prompt_id }, server.client_id)
+            if server.client_id is not None or _context_client_id(server) is not None:
+                server.send_sync("executed", { "node": unique_id, "display_node": display_node_id, "output": output_ui, "prompt_id": prompt_id }, _context_client_id(server))
         if has_subgraph:
             cached_outputs = []
             new_node_ids = []
@@ -673,6 +704,7 @@ class PromptExecutor:
         self.caches = CacheSet(cache_type=self.cache_type, cache_args=self.cache_args)
         self.status_messages = []
         self.success = True
+        self._context_token = None
 
     def add_message(self, event, data: dict, broadcast: bool):
         data = {
@@ -680,8 +712,9 @@ class PromptExecutor:
             "timestamp": int(time.time() * 1000),
         }
         self.status_messages.append((event, data))
-        if self.server.client_id is not None or broadcast:
-            self.server.send_sync(event, data, self.server.client_id)
+        client_id = _context_client_id(self.server)
+        if client_id is not None or broadcast:
+            self.server.send_sync(event, data, client_id)
 
     def handle_execution_error(self, prompt_id, prompt, current_outputs, executed, error, ex):
         node_id = error["node_id"]
@@ -731,12 +764,18 @@ class PromptExecutor:
         set_preview_method(extra_data.get("preview_method"))
 
         nodes.interrupt_processing(False)
+        comfy.model_management.reset_current_task_interrupt()
         self.prompt_model_tracker.start()
 
+        ctx = PromptExecutionContext(prompt_id)
         if "client_id" in extra_data:
+            ctx.client_id = extra_data["client_id"]
+            # Keep the server global in sync for single-worker / legacy callers
+            # (e.g. the websocket reconnect handler that re-sends last_node_id).
             self.server.client_id = extra_data["client_id"]
         else:
             self.server.client_id = None
+        self._context_token = _current_prompt_context.set(ctx)
 
         self.status_messages = []
         self.add_message("execution_start", { "prompt_id": prompt_id}, broadcast=False)
@@ -833,6 +872,7 @@ class PromptExecutor:
                     "meta": meta_outputs,
                 }
                 self.server.last_node_id = None
+                ctx.last_node_id = None
                 if comfy.model_management.DISABLE_SMART_MEMORY:
                     comfy.model_management.unload_all_models()
         finally:
@@ -841,6 +881,9 @@ class PromptExecutor:
             comfy.memory_management.set_ram_cache_release_state(None, 0)
             self.prompt_model_tracker.end()
             self._notify_prompt_lifecycle("end", prompt_id)
+            if self._context_token is not None:
+                _current_prompt_context.reset(self._context_token)
+                self._context_token = None
 
 
 async def validate_inputs(prompt_id, prompt, item, validated, visiting=None):
@@ -1305,6 +1348,21 @@ class PromptQueue:
             self.history[prompt[1]].update(history_result)
             self.server.queue_updated()
 
+    def requeue(self, item_id):
+        """Return a claimed item to the queue without recording history.
+
+        Used by device-affinity routing when a worker pulls a prompt pinned to
+        a different GPU: it releases the claim so the queue shows the prompt as
+        pending again, then re-enqueues it for the matching worker to claim.
+        """
+        with self.mutex:
+            item = self.currently_running.pop(item_id, None)
+            if item is None:
+                return
+            heapq.heappush(self.queue, item)
+            self.server.queue_updated()
+            self.not_empty.notify()
+
     # Note: slow
     def get_current_queue(self):
         with self.mutex:
@@ -1409,3 +1467,28 @@ class PromptQueue:
                 return ret
             else:
                 return self.flags.copy()
+
+    def set_flag_for_workers(self, name, data, num_workers):
+        """Set a flag that every worker must consume once before it is cleared.
+
+        Used by /free in multi-GPU mode so each worker resets its own caches
+        while global actions (unload_all_models) run once per generation.
+        """
+        with self.mutex:
+            self.flags[name] = {"data": data, "remaining": num_workers}
+            self.not_empty.notify()
+
+    def consume_flag_for_worker(self, name):
+        """Consume one worker's share of a broadcast flag. Returns the data
+        value if this worker should act on it, or None if the flag is absent
+        or already consumed by this worker's generation. The flag is removed
+        once every worker has consumed it."""
+        with self.mutex:
+            entry = self.flags.get(name)
+            if entry is None:
+                return None
+            entry["remaining"] -= 1
+            data = entry["data"]
+            if entry["remaining"] <= 0:
+                self.flags.pop(name, None)
+            return data
